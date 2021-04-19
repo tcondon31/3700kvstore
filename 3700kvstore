@@ -2,41 +2,273 @@
 
 import sys, socket, select, time, json, random
 
-# Your ID number
-my_id = sys.argv[1]
+# types of messages
+GET = "get"
+PUT = "put"
+APEN = "appendEntry"
+RQVT = "requestVote"
+RDRC = "redirect"
+VOTE = "vote"
+CONF = "confirmation"
 
-# The ID numbers of all the other replicas
-replica_ids = sys.argv[2:]
+# message fields
+SRC = "src"
+DST = "dst"
+TYPE = "type"
+LDR = "leader"
+MID = "MID"
+LLI = "lastLogIndex"
+LLT = "lastLogTerm"
+PLI = "prevLogIndex"
+PLT = "prevLogTerm"
 
-# Connect to the network. All messages to/from other replicas and clients will
-# occur over this socket
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-sock.connect(my_id)
+# if this timeout elapses, this replica will start a new election
+ELECTION_TIMEOUT = random.randint(10, 30)
 
-last = 0
+# represents this replica in its current state
+class Replica:
 
-while True:
-	ready = select.select([sock], [], [], 0.1)[0]
-	
-	if sock in ready:
-		msg_raw = sock.recv(32768)
+	def __init__(self, my_id, replica_ids):
+		self.my_id = my_id
+		self.replica_ids = replica_ids
+		self.cluster_size = len(self.replica_ids) + 1
+		self.is_leader = False 
+		self.is_candidate = False
+		self.supporters = []
+		self.voted_for = ""
+		self.curr_term = 1
+		self.curr_leader = "FFFF"
+		self.log = []
+		self.state_machine = {} # key value pairs
+		self.commit_index = 1
+		self.last_applied = 0
+		self.next_index = {} # maps replicas to indexes
+		self.match_index = []
+		self.prev_last_index = 0
+
+		# append an initial entry into the log (mainly for convenience)
+		first_entry = {"term": 1, "key": "init", "value": "init" }
+		self.log.append(first_entry)
+
+	# delegates to the appropriate message handler
+	def handle_message(self, msg, sock):
+		msg_type = msg[TYPE]
+		if msg_type in [GET, PUT] and not self.is_leader:
+			self.send_redirect(msg, sock)
+		elif msg_type == GET:
+			self.handle_get(msg, sock)
+		elif msg_type == PUT:
+			self.handle_put(msg, sock)
+		elif msg_type == APEN:
+			self.handle_appendEntry(msg, sock)
+		elif msg_type == RQVT:
+			self.handle_requestVote(msg, sock)
+		elif msg_type == VOTE:
+			self.handle_vote(msg, sock)
+		elif msg_type == CONF:
+			self.handle_confirmation(msg, sock)
+		else:
+			raise Exception("Received message of unknown type")
+
+
+
+
+
+	################# MESSAGE SENDERS #################
+
+	def send_fail(self, msg, sock):
+		fail_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "fail", MID: msg[MID] }
+		sock.send(json.dumps(fail_msg))
+
+	def send_redirect(self, msg, sock):
+		# if we don't know who the leader is, then send a fail message for them to try again later
+		if self.curr_leader is "FFFF":
+			print("redirect failed")
+			# self.send_fail(msg, sock)
+		else:
+			redir = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: RDRC, MID: msg[MID] }
+			sock.send(json.dumps(redir))
+
+	def send_requestVotes(self, sock):
+		print '%s is sending requestVotes' % (self.my_id)
+		lastIndex = len(self.log) - 1
+		lastTerm = self.log[lastIndex]["term"]
+		rv_msg = { SRC: self.my_id, DST: "FFFF", TYPE: RQVT, LDR: "FFFF", "term": self.curr_term, "candidateID": self.my_id, LLI: lastIndex, LLT: lastTerm } 
+		sock.send(json.dumps(rv_msg))
+
+	def send_vote(self, msg, sock, voteGranted):
+		vote_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: VOTE, "term": self.curr_term, "voteGranted": voteGranted }
+		sock.send(json.dumps(vote_msg))
+
+	def send_heartbeat(self, sock):
+		# prevLogTerm = self.log[self.commit_index]["term"]
+		heartbeat = { SRC: self.my_id, DST: "FFFF", TYPE: APEN, LDR: self.my_id, "term": self.curr_term, "entries": [] } 
+		sock.send(json.dumps(heartbeat))
+
+	def send_appendEntries(self, sock):
+		for replica in self.replica_ids:
+			next_to_send = self.next_index[replica]
+			entries = self.log[next_to_send:]
+			apen_msg = { SRC: self.my_id, DST: replica, TYPE: APEN, LDR: self.my_id, "term": self.curr_term,  "entries": entries }
+			sock.send(json.dumps(apen_msg))
+
+	def send_confirmation(self, msg, sock, length):
+		conf_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: CONF, "logLength": length }
+		sock.send(json.dumps(conf_msg))
+
+
+
+
+
+	################# MESSAGE HANDLERS ################
+
+	def handle_get(self, msg, sock):
+		key = msg["key"]
+		res = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "ok", MID: msg[MID], "value": "" }
+		if key in self.state_machine.keys():
+			res["value"] = self.state_machine[key]
+		sock.send(json.dumps(res))
+		print("GET success")
+		# TODO: when does a replica send a fail message????? maybe when we are a candidate????
+
+	def handle_put(self, msg, sock):
+		new_entry = { "term": self.curr_term, "key": msg["key"], "value": msg["value"] }
+		self.log.append(new_entry)
+		self.send_appendEntries(sock)
+		self.commit_index += 1
+		self.state_machine[msg["key"]] = msg["value"]
+		ok_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "ok", MID: msg[MID] }
+		sock.send(json.dumps(ok_msg))
+		print("PUT success")
+
+	def handle_requestVote(self, msg, sock):
+		# if this candidate's log is not as recent as ours
+		if msg[LLT] < self.curr_term:
+			# reply false - followers log is more up to date than the candidate
+			self.send_vote(msg, sock, False)
+		# if this candidate's log is as recent, but not as long
+		elif (msg[LLT] == self.curr_term) and (msg[LLI] < (len(self.log) - 1)):
+			# reply false - followers log is longer than the candidate
+			self.send_vote(msg, sock, False)
+		# # as long as we aren't a candidate
+		elif not self.is_candidate:
+			# grant vote and updated votedFor
+			self.send_vote(msg, sock, True)
+			self.voted_for = msg[SRC]
+
+	def handle_vote(self, msg, sock):
+		if msg["voteGranted"] and msg[SRC] not in self.supporters:
+			self.supporters.append(msg[SRC])
+
+
+	def handle_appendEntry(self, msg, sock):
+		if len(msg["entries"]) == 0:
+			# this is a heartbeat message
+			if self.curr_term <= msg["term"]:
+				self.reset_to_follower(msg[LDR], msg["term"])
+
+			elif self.curr_term > msg["term"]:
+				print("heartbeat failed")
+				# send a FAIL to the heartbeat and let server know that they are behind the game
+		else:
+			self.log.append(msg["entries"])
+			self.send_confirmation(msg, sock, len(self.log))
+
+
+	def handle_confirmation(self, msg, sock):
+		self.next_index[msg[SRC]] = msg["logLength"]
 		
-		if len(msg_raw) == 0: continue
-		msg = json.loads(msg_raw)
-		
-		# For now, ignore get() and put() from clients
-		if msg['type'] in ['get', 'put']:
-                        pass
-		
-		# Handle noop messages. This may be removed from your final implementation
-		elif msg['type'] == 'noop':
-			print '%s received a NOOP from %s' % (msg['dst'], msg['src'])
-		
-	clock = time.time()
-	if clock-last > 2:
-		# Send a no-op message to a random peer every two seconds, just for fun
-		# You definitely want to remove this from your implementation
-		msg = {'src': my_id, 'dst': random.choice(replica_ids), 'leader': 'FFFF', 'type': 'noop'}
-		sock.send(json.dumps(msg))
-		print '%s sending a NOOP to %s' % (msg['src'], msg['dst'])
-		last = clock
+	################# LEADER ELECTION #################
+
+	def start_election(self, sock):
+		print '%s is starting an election' % (self.my_id)
+		self.is_candidate = True
+		self.curr_leader = "FFFF"
+		self.supporters = [self.my_id]
+		self.curr_term += 1
+		self.send_requestVotes(sock)
+
+	def check_if_won(self):
+		if len(self.supporters) > (self.cluster_size / 2):
+			self.is_leader = True
+			self.is_candidate = False
+			self.supporters = []
+			return True
+		else:
+			return False
+
+	def initialize_leader(self):
+		# initialize self.next_index
+		# initialize self.match_index
+		self.curr_leader = self.my_id
+
+		for replica in replica_ids:
+			self.next_index[replica] = self.commit_index + 1
+
+	def reset_to_follower(self, new_leader, new_term):
+		self.is_leader = False
+		self.is_candidate = False
+		self.supporters = []
+		# recognize new leader
+		self.curr_term = new_term
+		self.curr_leader = new_leader
+
+	################# MAIN RUN LOOP #################
+
+	def run(self):
+		# Connect to the network. All messages to/from other replicas and clients will
+		# occur over this socket
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+		sock.connect(self.my_id)
+
+		last = 0
+		last_elect_or_msg = 0
+
+		while True:
+
+			if self.is_candidate:
+				if self.check_if_won():
+					print '%s won the election' % (self.my_id)
+					self.send_heartbeat(sock)
+					self.initialize_leader()
+
+			ready = select.select([sock], [], [], float(ELECTION_TIMEOUT))[0]
+			
+			if sock in ready:
+				msg_raw = sock.recv(32768)
+				
+				if len(msg_raw) == 0: continue
+				msg = json.loads(msg_raw)
+
+				now = time.time()
+				if msg[TYPE] in [ APEN, RQVT ]:
+					last_elect_or_msg = now
+				
+				if (now - last_elect_or_msg > ELECTION_TIMEOUT) and not self.is_leader:
+					self.start_election(sock)
+					last_elect_or_msg = now
+				
+				if msg[TYPE] not in ['noop']:
+					self.handle_message(msg, sock)
+
+			# if ready is empty, then select timed out
+			elif not ready:
+				print("timeout")
+				last_elect_or_msg = now
+				
+			clock = time.time()
+			if clock-last > 2:
+				pass
+				# send a heartbeat if need be
+
+
+
+if __name__ == "__main__":
+	if len(sys.argv) < 3:
+		raise Exception("Need at least 3 replicas")
+	else:
+		# Your ID number 
+		my_id = sys.argv[1]
+        # The ID numbers of all the other replicas
+		replica_ids = sys.argv[2:]
+		Replica(my_id, replica_ids).run()
