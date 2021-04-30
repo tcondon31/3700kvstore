@@ -8,6 +8,8 @@ PUT = "put"
 APEN = "appendEntry"
 RQVT = "requestVote"
 RDRC = "redirect"
+
+# responses to appendEntries and requestVote
 VOTE = "vote"
 CONF = "confirmation"
 
@@ -16,16 +18,37 @@ SRC = "src"
 DST = "dst"
 TYPE = "type"
 LDR = "leader"
+TERM = "term"
 MID = "MID"
-LLI = "lastLogIndex"
-LLT = "lastLogTerm"
 PLI = "prevLogIndex"
 PLT = "prevLogTerm"
 
-# if this timeout elapses, this replica will start a new election
-ELECTION_TIMEOUT = random.randint(10, 30)
+# request votes
+CAID = "candidateID"
+LLI = "lastLogIndex"
+LLT = "lastLogTerm"
+VTGR = "voteGranted"
 
-# represents this replica in its current state
+# for appendEntry responses
+FPLT = "followerPrevLastTerm"
+FPLI = "followerPrevLastIndex"
+
+LLAP = "leaderLastApplied"
+
+# if this timeout elapses, this replica will start a new election
+#ELECTION_TIMEOUT = random.random() * 3
+#if ELECTION_TIMEOUT < 0.5:
+#	ELECTION_TIMEOUT += 1
+
+# TODO: play with election timeouts!!!
+# how long should the election timeout be????
+
+# TODO: how to ensure that leader relection happen fast when there is a high drop rate
+
+
+
+
+
 class Replica:
 
 	def __init__(self, my_id, replica_ids):
@@ -35,22 +58,37 @@ class Replica:
 		self.is_leader = False 
 		self.is_candidate = False
 		self.supporters = []
-		self.voted_for = ""
+		self.rejections = 0
+
+		self.voted_for_term = 1 # voted for this term - ensures only ONE leader is elected per term
 		self.curr_term = 1
 		self.curr_leader = "FFFF"
 		self.log = []
 		self.state_machine = {} # key value pairs
-		self.commit_index = 1
-		self.last_applied = 0
-		self.next_index = {} # maps replicas to indexes
-		self.match_index = []
-		self.prev_last_index = 0
+
+		self.commit_index = 0 # last log index committed (successfully replicated) - at the start, this represents the FIRST entry (entry @ 0)
+		self.last_applied = 0 # last log index applied to state machine
+
+		# necessary for leaders
+		self.next_index = {} 
+		self.match_index = {}
+		self.get_queue = []
+
+		self.timeout = random.random() * 3
+		if self.timeout < 0.5:
+			self.timeout += 1
+
 
 		# append an initial entry into the log (mainly for convenience)
-		first_entry = {"term": 1, "key": "init", "value": "init" }
+		first_entry = {"term": 1, "key": "init", "value": "init" , "clientID": "X", "messageID": "X"}
 		self.log.append(first_entry)
 
-	# delegates to the appropriate message handler
+
+
+
+
+
+
 	def handle_message(self, msg, sock):
 		msg_type = msg[TYPE]
 		if msg_type in [GET, PUT] and not self.is_leader:
@@ -73,120 +111,349 @@ class Replica:
 
 
 
+	# TODO: restructure this whole class, divide into a couple more specific classes??
 
-	################# MESSAGE SENDERS #################
+	######################################## MESSAGE SENDERS ###########################################
 
-	def send_fail(self, msg, sock):
-		fail_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "fail", MID: msg[MID] }
-		sock.send(json.dumps(fail_msg))
+	#def send_fail(self, msg, sock):
+	#	fail_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "fail", MID: msg[MID] }
+	#	sock.send(json.dumps(fail_msg))
 
+
+	# TODO: what should happen if you receive a client message, but you don't know who the leader is?
 	def send_redirect(self, msg, sock):
-		# if we don't know who the leader is, then send a fail message for them to try again later
-		if self.curr_leader is "FFFF":
-			print("redirect failed")
-			# self.send_fail(msg, sock)
-		else:
-			redir = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: RDRC, MID: msg[MID] }
-			sock.send(json.dumps(redir))
+		if self.curr_leader == "FFFF":
+			self.curr_leader = self.my_id
+		redir = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: RDRC, MID: msg[MID] }
+		sock.send(json.dumps(redir))
 
 	def send_requestVotes(self, sock):
 		print '%s is sending requestVotes' % (self.my_id)
 		lastIndex = len(self.log) - 1
-		lastTerm = self.log[lastIndex]["term"]
-		rv_msg = { SRC: self.my_id, DST: "FFFF", TYPE: RQVT, LDR: "FFFF", "term": self.curr_term, "candidateID": self.my_id, LLI: lastIndex, LLT: lastTerm } 
+		lastTerm = self.log[lastIndex][TERM]
+		rv_msg = { SRC: self.my_id, DST: "FFFF", TYPE: RQVT, LDR: "FFFF", TERM: self.curr_term, CAID:  self.my_id, LLI: lastIndex, LLT: lastTerm } 
 		sock.send(json.dumps(rv_msg))
 
-	def send_vote(self, msg, sock, voteGranted):
-		vote_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: VOTE, "term": self.curr_term, "voteGranted": voteGranted }
+	def send_vote(self, msg, sock, lastIndex, lastTerm, voteGranted):
+		vote_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: VOTE, TERM: self.curr_term, LLI: lastIndex, LLT: lastTerm, VTGR: voteGranted }
 		sock.send(json.dumps(vote_msg))
+		# if we just voted for someone, wait
+		if voteGranted:
+			#time.sleep(0.5)
+			print '%s just voted for %s' % (self.my_id, msg[SRC])
 
 	def send_heartbeat(self, sock):
-		# prevLogTerm = self.log[self.commit_index]["term"]
-		heartbeat = { SRC: self.my_id, DST: "FFFF", TYPE: APEN, LDR: self.my_id, "term": self.curr_term, "entries": [] } 
+		# term of the last entry in the leaders log before the new ones being sent
+		# for heartbeats - should just be the last entry in the log?
+		prevLogIndex = len(self.log) - 1 
+		prevLogTerm = self.log[prevLogIndex][TERM]
+		
+		heartbeat = { SRC: self.my_id, DST: "FFFF", TYPE: APEN, LDR: self.my_id, TERM: self.curr_term, PLI: prevLogIndex, PLT: prevLogTerm, "leaderCommit": self.commit_index, "entries": [] } 
 		sock.send(json.dumps(heartbeat))
 
+
+	# sends the entries according to the leaders next_index record for the other replica
 	def send_appendEntries(self, sock):
 		for replica in self.replica_ids:
-			next_to_send = self.next_index[replica]
-			entries = self.log[next_to_send:]
-			apen_msg = { SRC: self.my_id, DST: replica, TYPE: APEN, LDR: self.my_id, "term": self.curr_term,  "entries": entries }
+			next_to_send = self.next_index[replica] 
+			prevLogIndex = next_to_send - 1
+			prevLogTerm = self.log[prevLogIndex][TERM]
+			entries_length = len(self.log) - next_to_send
+			if entries_length > 100:
+				entries = self.log[next_to_send:next_to_send + 50]
+			else: 
+				entries = self.log[next_to_send:]
+			print '%s is sending an append to %s with entries from index %d to %d with PLI: %d PLT: %d' % (self.my_id, replica, next_to_send, len(self.log) - 1, prevLogIndex, prevLogTerm)
+			apen_msg = { SRC: self.my_id, DST: replica, TYPE: APEN, LDR: self.my_id, TERM: self.curr_term, PLI: prevLogIndex, PLT: prevLogTerm, "leaderCommit": self.commit_index, LLAP: self.last_applied, "entries": entries }
 			sock.send(json.dumps(apen_msg))
+			self.next_index[replica] += len(entries)
 
-	def send_confirmation(self, msg, sock, length):
-		conf_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: CONF, "logLength": length }
+	# sends relevant information about this followers log, this followers current term, and whether the append was a success or not
+	def send_confirmation(self, msg, sock, success, followerPLI, followerPLT):
+		conf_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: CONF, TERM: self.curr_term, "success": success, FPLI: followerPLI, FPLT: followerPLT }
 		sock.send(json.dumps(conf_msg))
 
+	# sends a message to the client when the transaction completes
+	def send_okay(self, sock, client, message_id):
+		ok_msg = { SRC: self.my_id, DST: client, LDR: self.curr_leader, TYPE: "ok", MID: message_id}
+		sock.send(json.dumps(ok_msg))
 
 
 
 
-	################# MESSAGE HANDLERS ################
+
+
+
+	##################################### MESSAGE HANDLERS #############################################
+
+
+
+	# ------------------------------------- CLIENT RELATED ---------------------------------------------
+
+	def execute_getQueue(self, sock):
+		done = []
+		if len(self.get_queue) > 0:
+			print 'GET QUEUE INIT LEN = %d' % (len(self.get_queue))
+			for item in self.get_queue:
+				if self.commit_index >= item["indexReceivedAt"]:
+					print 'RESPONDED to a GET from index: %d CI: %d' % (item["indexReceivedAt"], self.commit_index)
+					key = item["key"]
+					res = { SRC: self.my_id, DST: item[SRC], LDR: self.curr_leader, TYPE: "ok", MID: item[MID], "value": "" }
+					if key in self.state_machine.keys():
+						res["value"] = self.state_machine[key]
+					sock.send(json.dumps(res))
+					done.append(item)
+
+			for item in done:
+				self.get_queue.remove(item)
+			print 'GET QUEUE LENGTH IS NOW %d' % (len(self.get_queue))
+
 
 	def handle_get(self, msg, sock):
-		key = msg["key"]
-		res = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "ok", MID: msg[MID], "value": "" }
-		if key in self.state_machine.keys():
-			res["value"] = self.state_machine[key]
-		sock.send(json.dumps(res))
-		print("GET success")
-		# TODO: when does a replica send a fail message????? maybe when we are a candidate????
+		if self.commit_index < len(self.log) - 1:
+			msg["indexReceivedAt"] = len(self.log) - 1
+			# hold onto this get request until we commit everything
+			self.get_queue.append(msg)
+		else:
+			self.execute_getQueue(sock)
+			key = msg["key"]
+			res = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "ok", MID: msg[MID], "value": "" }
+			if key in self.state_machine.keys():
+				res["value"] = self.state_machine[key]
+			sock.send(json.dumps(res))
+			# TODO: when does a replica send a fail message????? maybe when we are a candidate????
+
 
 	def handle_put(self, msg, sock):
-		new_entry = { "term": self.curr_term, "key": msg["key"], "value": msg["value"] }
+		#self.execute_getQueue(sock)
+		new_entry = { TERM: self.curr_term, "key": msg["key"], "value": msg["value"], "clientID": msg[SRC], "messageID": msg[MID] }
 		self.log.append(new_entry)
 		self.send_appendEntries(sock)
-		self.commit_index += 1
-		self.state_machine[msg["key"]] = msg["value"]
-		ok_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "ok", MID: msg[MID] }
-		sock.send(json.dumps(ok_msg))
-		print("PUT success")
+	# --------------------------------------------------------------------------------------------------
 
+
+
+	# -------------------------------------- ELECTION --------------------------------------------------
+	
 	def handle_requestVote(self, msg, sock):
-		# if this candidate's log is not as recent as ours
-		if msg[LLT] < self.curr_term:
-			# reply false - followers log is more up to date than the candidate
-			self.send_vote(msg, sock, False)
-		# if this candidate's log is as recent, but not as long
-		elif (msg[LLT] == self.curr_term) and (msg[LLI] < (len(self.log) - 1)):
-			# reply false - followers log is longer than the candidate
-			self.send_vote(msg, sock, False)
-		# # as long as we aren't a candidate
-		elif not self.is_candidate:
-			# grant vote and updated votedFor
-			self.send_vote(msg, sock, True)
-			self.voted_for = msg[SRC]
+		# the last index of our log
+		lastIndex = len(self.log) - 1
+		lastTerm = self.log[lastIndex][TERM]
+
+		# if we already voted in this term or are ahead, send rejection
+		if self.voted_for_term >= msg[TERM]:
+			self.send_vote(msg, sock, lastIndex, lastTerm, False)
+
+		# else, we have not voted for this term yet
+		elif self.voted_for_term < msg[TERM]:
+
+			# if the message's log is not as up to date as ours - automatic no
+			if msg[LLT] < self.log[lastIndex][TERM]:
+				print '%s rejected %s' % (self.my_id, msg[SRC])
+				self.send_vote(msg, sock, lastIndex, lastTerm, False)
+
+			# if the messages log is more up to date than ours - automatic yes
+			elif msg[LLT] > self.log[lastIndex][TERM]:
+				print '%s is sending vote to %s' % (self.my_id, msg[SRC])
+				self.voted_for_term = msg[TERM]
+				self.is_candidate = False
+				self.is_leader = False
+				self.send_vote(msg, sock, lastIndex, lastTerm, True)
+
+			# our log is longer - automatic no
+			elif (msg[LLT] == self.log[lastIndex][TERM]) and (msg[LLI] < (len(self.log) - 1)):
+				print '%s rejected %s' % (self.my_id, msg[SRC])
+				self.send_vote(msg, sock, lastIndex, lastTerm, False)
+
+			# their log is longer - automatic yes
+			elif (msg[LLT] == self.log[lastIndex][TERM]) and (msg[LLI] > (len(self.log) - 1)):
+				print '%s is sending vote to %s' % (self.my_id, msg[SRC])
+				self.is_candidate = False
+				self.is_leader = False
+				self.send_vote(msg, sock, lastIndex, lastTerm, True)
+				self.voted_for_term = msg[TERM]
+
+			# --- if we got here, the logs are exactly the same ---
+
+			# if we are a candidate in this term and with equal qualifications
+			elif (self.curr_term == msg[TERM]) and self.is_candidate:
+				# reject - we are also trying to win the election
+				print '%s is sending rejection to %s' % (self.my_id, msg[SRC])
+				self.send_vote(msg, sock, lastIndex, lastTerm, False)
+			elif (self.curr_term >= msg[TERM]):
+				self.send_vote(msg,sock, lastIndex, lastTerm, False)
+			else:
+				# send vote for this candidate
+				print '%s is sending vote to %s' % (self.my_id, msg[SRC])
+				self.send_vote(msg, sock, lastIndex, lastTerm, True)
+				self.voted_for_term = msg[TERM]
+				self.reset_to_follower("FFFF", msg[TERM])
+
+
+
 
 	def handle_vote(self, msg, sock):
-		if msg["voteGranted"] and msg[SRC] not in self.supporters:
+		if not self.is_candidate:
+			return # ignore this vote if we arent a candidate
+
+		lastIndex = len(self.log) - 1
+		lastTerm = self.log[lastIndex][TERM]
+
+		# TODO: check if we received a message from someone in a higher term
+		if not msg[VTGR]:
+			if lastIndex == msg[LLI] and lastTerm == msg[LLT] and self.curr_term == msg[TERM]:
+				# the only reason they didn't get this person's vote was bc they are running in the same election
+				# with equal qualifications
+				return
+			else:
+				if self.rejections >= (len(self.log) // 2):
+					# reset to follower, drop out of election
+					# increase timeout so we dont try again soon
+					self.timeout += 2
+					# decrement term (since we incremented it at the start of the election)
+					self.curr_term -= 1
+					self.is_candidate = False
+					print '%s dropped out of election' % (self.my_id)
+				else:
+					self.rejections += 1
+		else:
+			print '%s received vote from %s' % (self.my_id, msg[SRC])
 			self.supporters.append(msg[SRC])
 
+	# --------------------------------------------------------------------------------------------------
 
+
+
+	# ------------------------------------- LOG REPLICATION --------------------------------------------
 	def handle_appendEntry(self, msg, sock):
+
+		# heartbeats
 		if len(msg["entries"]) == 0:
-			# this is a heartbeat message
 			if self.curr_term <= msg["term"]:
 				self.reset_to_follower(msg[LDR], msg["term"])
-
-			elif self.curr_term > msg["term"]:
-				print("heartbeat failed")
-				# send a FAIL to the heartbeat and let server know that they are behind the game
 		else:
-			self.log.append(msg["entries"])
-			self.send_confirmation(msg, sock, len(self.log))
+			# actual append entries
+			leaderPLI = msg[PLI]
+			leaderPLT = msg[PLT]
+
+			followerPLI = len(self.log) - 1 # our previous log index
+			# get where the two logs line up, if the followers log is too long
+			while followerPLI > leaderPLI:
+				followerPLI -= 1
+			followerPLT = self.log[followerPLI]["term"] # our previous log term
+
+			print '%s received append - my PLI: %d | my PLT: %d' % (self.my_id, followerPLI, followerPLT)
+			print '%s s message PLI: %d message PLT: %d' % (self.my_id, msg[PLI], msg[PLT])
+
+			if self.curr_term <= msg["term"]: 
+				self.reset_to_follower(msg[LDR], msg["term"]) 
+
+				# check if we can safely append the new entries
+				if (followerPLI == msg[PLI]) and (followerPLT == msg[PLT]):
+					# yes! our log is perfectly up to date
+					# append the new entries after the the previous entry we just checked
+					self.log[followerPLI + 1:] = msg["entries"]
+					newLastIndex = len(self.log) - 1
+					newLastTerm = self.log[newLastIndex]["term"]
+					self.send_confirmation(msg, sock, True, newLastIndex, newLastTerm)
+					print '%s IS SENDING SUCCESS TO APPEND MSG - new last index: %d | new last term: %d' % (self.my_id, newLastIndex, newLastTerm)
+
+					# update this followers commit index
+					# later update the state machine
+					self.commit_index = msg["leaderCommit"]
+
+					if self.last_applied < self.commit_index:
+						next_to_apply = self.last_applied + 1
+						entry_to_apply = self.log[next_to_apply]
+						self.state_machine[entry_to_apply["key"]] = entry_to_apply["value"]
+						self.last_applied += 1
+						
+
+				# we cannot safely append the new entries 
+				else:
+					# first - get their logs to the same length
+					while leaderPLI > followerPLI:
+						leaderPLI -= 1
+					# send the term at this entry in the followers log
+					followerPLT = self.log[followerPLI]["term"]
+					print '%s IS SENDING A FAILURE TO APPEND - current last index: %d | current last term: %d' % (self.my_id, followerPLI, followerPLT)
+					self.send_confirmation(msg, sock, False, followerPLI, followerPLT)
+
+			elif leaderPLI >= followerPLI and leaderPLT >= followerPLT:
+				self.reset_to_follower(msg[LDR], msg[TERM])
 
 
 	def handle_confirmation(self, msg, sock):
-		self.next_index[msg[SRC]] = msg["logLength"]
-		
-	################# LEADER ELECTION #################
+		replica = msg[SRC]
+
+		if self.curr_term < msg[TERM]:
+			self.reset_to_follower(msg[LDR], msg["term"])
+
+		elif msg["success"]:
+
+			print 'LEADER APPENDED SUCCESSFULLY. Next index to send to %s is %s' % (replica, msg[FPLI] + 1)
+			self.match_index[replica] = msg[FPLI]
+
+			# leader needs to check after each successful append if they can commit any new entries
+			next_to_commit = self.commit_index + 1
+			while next_to_commit < len(self.log):
+				next_entry = self.log[next_to_commit]
+				if next_entry["term"] < self.curr_term:
+					next_to_commit += 1
+				elif next_entry["term"] == self.curr_term:
+					total = 0
+					for rep in self.replica_ids:
+						if self.match_index[rep] >= next_to_commit:
+							total += 1
+					if total >= ((len(self.replica_ids) // 2)):
+						print 'LEADER updated commit index: %d' % (next_to_commit)
+						self.commit_index = next_to_commit
+						next_to_commit += 1
+					else:
+						break
+			
+			# now write to leaders state machine
+			next_to_apply = self.last_applied + 1
+			while next_to_apply <= self.commit_index:
+				next_entry = self.log[next_to_apply]
+				self.state_machine[next_entry["key"]] = next_entry["value"]
+				self.last_applied = next_to_apply
+				# now we can tell the client we successfully did the put 
+				self.send_okay(sock, next_entry["clientID"], next_entry["messageID"])
+				next_to_apply += 1
+			print 'LEADER applied up to: %d' % (self.last_applied)
+			# ---------------------- end of leader updates ------------------------------
+				
+
+		# ---------------- failure case: follower log not in sync -------------------------
+		else:
+			followerPLI = msg[FPLI] # the last index of the shorter of the two logs
+			followerPLT = msg[FPLT] # the term of ^ entry
+
+			if self.log[followerPLI][TERM] == followerPLT:
+				if self.match_index[replica] <= followerPLI:
+					self.next_index[replica] = followerPLI + 1
+					self.match_index[replica] = followerPLI
+					print '%s - match index is now: %d | next index is now: %d' % (replica, self.match_index[replica], self.next_index[replica])
+			elif self.log[followerPLI][TERM] != followerPLT:
+				self.next_index[replica] = followerPLI
+
+
+
+
+
+
+	########################################### LEADER ELECTION ########################################
 
 	def start_election(self, sock):
-		print '%s is starting an election' % (self.my_id)
 		self.is_candidate = True
 		self.curr_leader = "FFFF"
 		self.supporters = [self.my_id]
 		self.curr_term += 1
+		print '%s is starting an election for term: %d' % (self.my_id, self.curr_term)
 		self.send_requestVotes(sock)
+		self.rejections = 0
+
 
 	def check_if_won(self):
 		if len(self.supporters) > (self.cluster_size / 2):
@@ -198,22 +465,27 @@ class Replica:
 			return False
 
 	def initialize_leader(self):
-		# initialize self.next_index
-		# initialize self.match_index
+		# next_index gets initialized to the item right after the last one in this leaders log
 		self.curr_leader = self.my_id
-
-		for replica in replica_ids:
-			self.next_index[replica] = self.commit_index + 1
+		for replica in self.replica_ids:
+			self.next_index[replica] = len(self.log)
+			self.match_index[replica] = 0
+		self.get_queue = []
 
 	def reset_to_follower(self, new_leader, new_term):
 		self.is_leader = False
 		self.is_candidate = False
 		self.supporters = []
-		# recognize new leader
+		self.next_index = {}
+		self.match_index = {}
 		self.curr_term = new_term
 		self.curr_leader = new_leader
+		#self.get_queue = []
 
-	################# MAIN RUN LOOP #################
+
+
+
+	###################################### MAIN RUN LOOP ###############################################
 
 	def run(self):
 		# Connect to the network. All messages to/from other replicas and clients will
@@ -221,8 +493,10 @@ class Replica:
 		sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 		sock.connect(self.my_id)
 
-		last = 0
+		last = time.time()
 		last_elect_or_msg = 0
+
+		print '%s ELECTION TIMEOUT: %f' % (self.my_id, self.timeout)
 
 		while True:
 
@@ -231,8 +505,8 @@ class Replica:
 					print '%s won the election' % (self.my_id)
 					self.send_heartbeat(sock)
 					self.initialize_leader()
-
-			ready = select.select([sock], [], [], float(ELECTION_TIMEOUT))[0]
+			# select returns a list of lists
+			ready = select.select([sock], [], [], self.timeout)[0]
 			
 			if sock in ready:
 				msg_raw = sock.recv(32768)
@@ -240,28 +514,27 @@ class Replica:
 				if len(msg_raw) == 0: continue
 				msg = json.loads(msg_raw)
 
-				now = time.time()
-				if msg[TYPE] in [ APEN, RQVT ]:
-					last_elect_or_msg = now
+
+				# restart counter before potentially starting
+				if msg[TYPE] in [ APEN, VOTE ]:
+					last_elect_or_msg = time.time()
 				
-				if (now - last_elect_or_msg > ELECTION_TIMEOUT) and not self.is_leader:
+				if (time.time() - last_elect_or_msg > self.timeout) and not self.is_leader:
 					self.start_election(sock)
-					last_elect_or_msg = now
+					last_elect_or_msg = time.time()
 				
-				if msg[TYPE] not in ['noop']:
-					self.handle_message(msg, sock)
+				self.handle_message(msg, sock)
 
-			# if ready is empty, then select timed out
-			elif not ready:
-				print("timeout")
-				last_elect_or_msg = now
+				# restart counter after handle message
+				if msg[TYPE] in [ APEN, RQVT, VOTE ]:
+					last_elect_or_msg = time.time()
+
+				if time.time() - last_elect_or_msg > 2:
+					if self.is_leader:
+						#self.send_appendEntries(sock)
+						self.execute_getQueue(sock)
+						#last_elect_or_msg = time.time()
 				
-			clock = time.time()
-			if clock-last > 2:
-				pass
-				# send a heartbeat if need be
-
-
 
 if __name__ == "__main__":
 	if len(sys.argv) < 3:
