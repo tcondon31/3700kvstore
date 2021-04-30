@@ -35,20 +35,6 @@ FPLI = "followerPrevLastIndex"
 
 LLAP = "leaderLastApplied"
 
-# if this timeout elapses, this replica will start a new election
-#ELECTION_TIMEOUT = random.random() * 3
-#if ELECTION_TIMEOUT < 0.5:
-#	ELECTION_TIMEOUT += 1
-
-# TODO: play with election timeouts!!!
-# how long should the election timeout be????
-
-# TODO: how to ensure that leader relection happen fast when there is a high drop rate
-
-
-
-
-
 class Replica:
 
 	def __init__(self, my_id, replica_ids):
@@ -77,16 +63,9 @@ class Replica:
 		if self.timeout < 0.5:
 			self.timeout += 1
 
-
 		# append an initial entry into the log (mainly for convenience)
 		first_entry = {"term": 1, "key": "init", "value": "init" , "clientID": "X", "messageID": "X"}
 		self.log.append(first_entry)
-
-
-
-
-
-
 
 	def handle_message(self, msg, sock):
 		msg_type = msg[TYPE]
@@ -107,19 +86,8 @@ class Replica:
 		else:
 			raise Exception("Received message of unknown type")
 
-
-
-
-	# TODO: restructure this whole class, divide into a couple more specific classes??
-
 	######################################## MESSAGE SENDERS ###########################################
 
-	#def send_fail(self, msg, sock):
-	#	fail_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: "fail", MID: msg[MID] }
-	#	sock.send(json.dumps(fail_msg))
-
-
-	# TODO: what should happen if you receive a client message, but you don't know who the leader is?
 	def send_redirect(self, msg, sock):
 		if self.curr_leader == "FFFF":
 			self.curr_leader = self.my_id
@@ -127,7 +95,6 @@ class Replica:
 		sock.send(json.dumps(redir))
 
 	def send_requestVotes(self, sock):
-		#print '%s is sending requestVotes' % (self.my_id)
 		lastIndex = len(self.log) - 1
 		lastTerm = self.log[lastIndex][TERM]
 		rv_msg = { SRC: self.my_id, DST: "FFFF", TYPE: RQVT, LDR: "FFFF", TERM: self.curr_term, CAID:  self.my_id, LLI: lastIndex, LLT: lastTerm } 
@@ -136,14 +103,10 @@ class Replica:
 	def send_vote(self, msg, sock, lastIndex, lastTerm, voteGranted):
 		vote_msg = { SRC: self.my_id, DST: msg[SRC], LDR: self.curr_leader, TYPE: VOTE, TERM: self.curr_term, LLI: lastIndex, LLT: lastTerm, VTGR: voteGranted }
 		sock.send(json.dumps(vote_msg))
-		# if we just voted for someone, wait
-		#if voteGranted:
-			#time.sleep(0.5)
-			#print '%s just voted for %s' % (self.my_id, msg[SRC])
 
 	def send_heartbeat(self, sock):
 		# term of the last entry in the leaders log before the new ones being sent
-		# for heartbeats - should just be the last entry in the log?
+		# for heartbeats - should just be the last entry in the log
 		prevLogIndex = len(self.log) - 1 
 		prevLogTerm = self.log[prevLogIndex][TERM]
 		
@@ -162,7 +125,6 @@ class Replica:
 				entries = self.log[next_to_send:next_to_send + 50]
 			else: 
 				entries = self.log[next_to_send:]
-			#print '%s is sending an append to %s with entries from index %d to %d with PLI: %d PLT: %d' % (self.my_id, replica, next_to_send, len(self.log) - 1, prevLogIndex, prevLogTerm)
 			apen_msg = { SRC: self.my_id, DST: replica, TYPE: APEN, LDR: self.my_id, TERM: self.curr_term, PLI: prevLogIndex, PLT: prevLogTerm, "leaderCommit": self.commit_index, LLAP: self.last_applied, "entries": entries }
 			sock.send(json.dumps(apen_msg))
 			self.next_index[replica] += len(entries)
@@ -177,25 +139,15 @@ class Replica:
 		ok_msg = { SRC: self.my_id, DST: client, LDR: self.curr_leader, TYPE: "ok", MID: message_id}
 		sock.send(json.dumps(ok_msg))
 
-
-
-
-
-
-
 	##################################### MESSAGE HANDLERS #############################################
-
-
 
 	# ------------------------------------- CLIENT RELATED ---------------------------------------------
 
 	def execute_getQueue(self, sock):
 		done = []
 		if len(self.get_queue) > 0:
-			#print 'GET QUEUE INIT LEN = %d' % (len(self.get_queue))
 			for item in self.get_queue:
 				if self.commit_index >= item["indexReceivedAt"]:
-					#print 'RESPONDED to a GET from index: %d CI: %d' % (item["indexReceivedAt"], self.commit_index)
 					key = item["key"]
 					res = { SRC: self.my_id, DST: item[SRC], LDR: self.curr_leader, TYPE: "ok", MID: item[MID], "value": "" }
 					if key in self.state_machine.keys():
@@ -205,8 +157,6 @@ class Replica:
 
 			for item in done:
 				self.get_queue.remove(item)
-			#print 'GET QUEUE LENGTH IS NOW %d' % (len(self.get_queue))
-
 
 	def handle_get(self, msg, sock):
 		if self.commit_index < len(self.log) - 1:
@@ -220,17 +170,13 @@ class Replica:
 			if key in self.state_machine.keys():
 				res["value"] = self.state_machine[key]
 			sock.send(json.dumps(res))
-			# TODO: when does a replica send a fail message????? maybe when we are a candidate????
-
 
 	def handle_put(self, msg, sock):
-		#self.execute_getQueue(sock)
 		new_entry = { TERM: self.curr_term, "key": msg["key"], "value": msg["value"], "clientID": msg[SRC], "messageID": msg[MID] }
 		self.log.append(new_entry)
 		self.send_appendEntries(sock)
+
 	# --------------------------------------------------------------------------------------------------
-
-
 
 	# -------------------------------------- ELECTION --------------------------------------------------
 	
@@ -248,12 +194,10 @@ class Replica:
 
 			# if the message's log is not as up to date as ours - automatic no
 			if msg[LLT] < self.log[lastIndex][TERM]:
-				#print '%s rejected %s' % (self.my_id, msg[SRC])
 				self.send_vote(msg, sock, lastIndex, lastTerm, False)
 
 			# if the messages log is more up to date than ours - automatic yes
 			elif msg[LLT] > self.log[lastIndex][TERM]:
-				#print '%s is sending vote to %s' % (self.my_id, msg[SRC])
 				self.voted_for_term = msg[TERM]
 				self.is_candidate = False
 				self.is_leader = False
@@ -261,12 +205,10 @@ class Replica:
 
 			# our log is longer - automatic no
 			elif (msg[LLT] == self.log[lastIndex][TERM]) and (msg[LLI] < (len(self.log) - 1)):
-				#print '%s rejected %s' % (self.my_id, msg[SRC])
 				self.send_vote(msg, sock, lastIndex, lastTerm, False)
 
 			# their log is longer - automatic yes
 			elif (msg[LLT] == self.log[lastIndex][TERM]) and (msg[LLI] > (len(self.log) - 1)):
-				#print '%s is sending vote to %s' % (self.my_id, msg[SRC])
 				self.is_candidate = False
 				self.is_leader = False
 				self.send_vote(msg, sock, lastIndex, lastTerm, True)
@@ -277,19 +219,14 @@ class Replica:
 			# if we are a candidate in this term and with equal qualifications
 			elif (self.curr_term == msg[TERM]) and self.is_candidate:
 				# reject - we are also trying to win the election
-				#print '%s is sending rejection to %s' % (self.my_id, msg[SRC])
 				self.send_vote(msg, sock, lastIndex, lastTerm, False)
 			elif (self.curr_term >= msg[TERM]):
 				self.send_vote(msg,sock, lastIndex, lastTerm, False)
 			else:
 				# send vote for this candidate
-				#print '%s is sending vote to %s' % (self.my_id, msg[SRC])
 				self.send_vote(msg, sock, lastIndex, lastTerm, True)
 				self.voted_for_term = msg[TERM]
 				self.reset_to_follower("FFFF", msg[TERM])
-
-
-
 
 	def handle_vote(self, msg, sock):
 		if not self.is_candidate:
@@ -298,7 +235,6 @@ class Replica:
 		lastIndex = len(self.log) - 1
 		lastTerm = self.log[lastIndex][TERM]
 
-		# TODO: check if we received a message from someone in a higher term
 		if not msg[VTGR]:
 			if lastIndex == msg[LLI] and lastTerm == msg[LLT] and self.curr_term == msg[TERM]:
 				# the only reason they didn't get this person's vote was bc they are running in the same election
@@ -311,16 +247,13 @@ class Replica:
 				# decrement term (since we incremented it at the start of the election)
 				self.curr_term -= 1
 				self.is_candidate = False
-				#print '%s dropped out of election' % (self.my_id)
 		else:
-			#print '%s received vote from %s' % (self.my_id, msg[SRC])
 			self.supporters.append(msg[SRC])
 
 	# --------------------------------------------------------------------------------------------------
 
-
-
 	# ------------------------------------- LOG REPLICATION --------------------------------------------
+	
 	def handle_appendEntry(self, msg, sock):
 
 		# heartbeats
@@ -338,9 +271,6 @@ class Replica:
 				followerPLI -= 1
 			followerPLT = self.log[followerPLI]["term"] # our previous log term
 
-			#print '%s received append - my PLI: %d | my PLT: %d' % (self.my_id, followerPLI, followerPLT)
-			#print '%s s message PLI: %d message PLT: %d' % (self.my_id, msg[PLI], msg[PLT])
-
 			if self.curr_term <= msg["term"]: 
 				self.reset_to_follower(msg[LDR], msg["term"]) 
 
@@ -352,7 +282,6 @@ class Replica:
 					newLastIndex = len(self.log) - 1
 					newLastTerm = self.log[newLastIndex]["term"]
 					self.send_confirmation(msg, sock, True, newLastIndex, newLastTerm)
-					#print '%s IS SENDING SUCCESS TO APPEND MSG - new last index: %d | new last term: %d' % (self.my_id, newLastIndex, newLastTerm)
 
 					# update this followers commit index
 					# later update the state machine
@@ -372,9 +301,7 @@ class Replica:
 						leaderPLI -= 1
 					# send the term at this entry in the followers log
 					followerPLT = self.log[followerPLI]["term"]
-					#print '%s IS SENDING A FAILURE TO APPEND - current last index: %d | current last term: %d' % (self.my_id, followerPLI, followerPLT)
 					self.send_confirmation(msg, sock, False, followerPLI, followerPLT)
-
 
 	def handle_confirmation(self, msg, sock):
 		replica = msg[SRC]
@@ -384,7 +311,6 @@ class Replica:
 
 		elif msg["success"]:
 
-			#print 'LEADER APPENDED SUCCESSFULLY. Next index to send to %s is %s' % (replica, msg[FPLI] + 1)
 			self.match_index[replica] = msg[FPLI]
 
 			# leader needs to check after each successful append if they can commit any new entries
@@ -399,7 +325,6 @@ class Replica:
 						if self.match_index[rep] >= next_to_commit:
 							total += 1
 					if total >= ((len(self.replica_ids) // 2)):
-						#print 'LEADER updated commit index: %d' % (next_to_commit)
 						self.commit_index = next_to_commit
 						next_to_commit += 1
 					else:
@@ -414,10 +339,9 @@ class Replica:
 				# now we can tell the client we successfully did the put 
 				self.send_okay(sock, next_entry["clientID"], next_entry["messageID"])
 				next_to_apply += 1
-			#print 'LEADER applied up to: %d' % (self.last_applied)
+
 			# ---------------------- end of leader updates ------------------------------
 				
-
 		# ---------------- failure case: follower log not in sync -------------------------
 		else:
 			followerPLI = msg[FPLI] # the last index of the shorter of the two logs
@@ -427,14 +351,8 @@ class Replica:
 				if self.match_index[replica] <= followerPLI:
 					self.next_index[replica] = followerPLI + 1
 					self.match_index[replica] = followerPLI
-					#print '%s - match index is now: %d | next index is now: %d' % (replica, self.match_index[replica], self.next_index[replica])
 			elif self.log[followerPLI][TERM] != followerPLT:
 				self.next_index[replica] = followerPLI
-
-
-
-
-
 
 	########################################### LEADER ELECTION ########################################
 
@@ -443,9 +361,7 @@ class Replica:
 		self.curr_leader = "FFFF"
 		self.supporters = [self.my_id]
 		self.curr_term += 1
-		#print '%s is starting an election for term: %d' % (self.my_id, self.curr_term)
 		self.send_requestVotes(sock)
-
 
 	def check_if_won(self):
 		if len(self.supporters) > (self.cluster_size / 2):
@@ -474,9 +390,6 @@ class Replica:
 		self.curr_leader = new_leader
 		#self.get_queue = []
 
-
-
-
 	###################################### MAIN RUN LOOP ###############################################
 
 	def run(self):
@@ -488,13 +401,10 @@ class Replica:
 		last = time.time()
 		last_elect_or_msg = 0
 
-		#print '%s ELECTION TIMEOUT: %f' % (self.my_id, self.timeout)
-
 		while True:
 
 			if self.is_candidate:
 				if self.check_if_won():
-					#print '%s won the election' % (self.my_id)
 					self.send_heartbeat(sock)
 					self.initialize_leader()
 			# select returns a list of lists
@@ -505,7 +415,6 @@ class Replica:
 				
 				if len(msg_raw) == 0: continue
 				msg = json.loads(msg_raw)
-
 
 				# restart counter before potentially starting
 				if msg[TYPE] in [ APEN, RQVT, VOTE ]:
@@ -523,10 +432,7 @@ class Replica:
 
 				if time.time() - last_elect_or_msg > 2:
 					if self.is_leader:
-						#self.send_appendEntries(sock)
-						self.execute_getQueue(sock)
-						#last_elect_or_msg = time.time()
-				
+						self.execute_getQueue(sock)	
 
 if __name__ == "__main__":
 	if len(sys.argv) < 3:
